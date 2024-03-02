@@ -4,11 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	codec2 "gorpc/src/codec"
+	"gorpc/src/codec"
 	"gorpc/src/common"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -60,7 +61,7 @@ func (s *Server) Accept(lis net.Listener) {
 
 func (s *Server) serveConn(conn io.ReadWriteCloser) {
 	var opt common.Option
-	if err := json.NewDecoder(conn).Decode(opt); err != nil {
+	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
 		log.Println("rpc server: options error: ", err)
 		return
 	}
@@ -68,7 +69,7 @@ func (s *Server) serveConn(conn io.ReadWriteCloser) {
 		log.Println("rpc server: invalid magic number: ", opt.MagicNumber)
 		return
 	}
-	f := codec2.NewCodecFuncMap[opt.CodecType]
+	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		log.Println("rpc server: invalid codec type: ", opt.CodecType)
 		return
@@ -78,7 +79,7 @@ func (s *Server) serveConn(conn io.ReadWriteCloser) {
 
 var invalidRequest = struct{}{}
 
-func (s *Server) serveCodec(cc codec2.Codec, opt *common.Option) {
+func (s *Server) serveCodec(cc codec.Codec, opt *common.Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
@@ -98,23 +99,32 @@ func (s *Server) serveCodec(cc codec2.Codec, opt *common.Option) {
 	cc.Close()
 }
 
-func (s *Server) readRequest(cc codec2.Codec) (*request, error) {
+func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 	h, err := s.readRequestHeader(cc)
 	if err != nil {
 		return nil, err
 	}
 	req := &request{h: h}
-	// TODO build service by header
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv); err != nil {
+	req.svc, req.mtype, err = s.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read body err:", err)
 		return req, err
 	}
 	return req, nil
 }
 
-func (s *Server) readRequestHeader(cc codec2.Codec) (*codec2.Header, error) {
-	var h codec2.Header
+func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
+	var h codec.Header
 	if err := cc.ReadHeader(&h); err != nil {
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
 			log.Println("rpc server: read header error: ", err)
@@ -124,18 +134,23 @@ func (s *Server) readRequestHeader(cc codec2.Codec) (*codec2.Header, error) {
 	return &h, nil
 }
 
-func (s *Server) handleRequest(cc codec2.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
 	called := make(chan struct{})
 	sent := make(chan struct{})
 	go func() {
-		// TODO invoke method
-		log.Println("rpc server: handle request", req.h.ServiceMethod, req.argv)
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
 		called <- struct{}{}
-		s.sendResponse(cc, req.h, "hello go rpc", sending)
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 		sent <- struct{}{}
-		return
 	}()
+
 	if timeout == 0 {
 		<-called
 		<-sent
@@ -143,14 +158,14 @@ func (s *Server) handleRequest(cc codec2.Codec, req *request, sending *sync.Mute
 	}
 	select {
 	case <-time.After(timeout):
-		req.h.Error = fmt.Sprint("rpc server: request handle timeout: ")
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
 		s.sendResponse(cc, req.h, invalidRequest, sending)
 	case <-called:
 		<-sent
 	}
 }
 
-func (s *Server) sendResponse(cc codec2.Codec, header *codec2.Header, body interface{}, sending *sync.Mutex) {
+func (s *Server) sendResponse(cc codec.Codec, header *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
 	if err := cc.Write(header, body); err != nil {
@@ -158,4 +173,48 @@ func (s *Server) sendResponse(cc codec2.Codec, header *codec2.Header, body inter
 	}
 }
 
+const (
+	Connected      = "200 Connected to Gee RPC"
+	DefaultRPCPath = "/_geeprc_"
+)
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+Connected+"\n\n")
+	s.serveConn(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(DefaultRPCPath, s)
+}
+
 var _ servor = (*Server)(nil)
+
+// HandleHTTP is a convenient approach for default server to register HTTP handlers
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
+
+var _ servor = (*Server)(nil)
+
+func NewServer() *Server {
+	return &Server{}
+}
+
+var DefaultServer = NewServer()
+
+func Accept(lis net.Listener) {
+	DefaultServer.Accept(lis)
+}
+
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }

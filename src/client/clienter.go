@@ -5,7 +5,7 @@ import "context"
 type clienter interface {
 	registerCall(call *Call) (uint64, error)
 	removeCall(seq uint64) *Call
-	terminateCalls()
+	terminateCalls(err error)
 	receive()
 	send(call *Call)
 	Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
